@@ -20,6 +20,11 @@ SHARE=/usr/local/share/AutoScriptPsiphon
 WEB_PORT=8080
 PROTO_PORTS="--protocol SSH:3001 --protocol OSSH:3002"
 
+# 1 = pakai binary jadi (tanpa Go, cepat) ; 0 = build dari source (butuh Go 1.21+, beberapa menit)
+USE_PREBUILT=${USE_PREBUILT:-1}
+PREBUILT_URL=${PREBUILT_URL:-https://github.com/citrakampank-hue/auto-psiphon/releases/download/v1.0/psiphond-linux-amd64}
+PREBUILT_SHA256=${PREBUILT_SHA256:-de6aeaba2fdbfb2a13fc03a8f375f0415455a97d3614cac26301f579ebcc834e}
+
 info "pasang dependency dasar"
 if command -v apt >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
@@ -29,12 +34,17 @@ else
   die "hanya dukung apt (Debian/Ubuntu)"
 fi
 
-# --- Go toolchain ---
-need_go=1
-if command -v go >/dev/null 2>&1; then
-  gv=$(go env GOVERSION 2>/dev/null | sed 's/go//')
-  major=${gv%%.*}; rest=${gv#*.}; minor=${rest%%.*}
-  if [ "${major:-0}" -ge 1 ] && [ "${minor:-0}" -ge 21 ]; then need_go=0; fi
+# --- Go toolchain (hanya kalau build dari source) ---
+need_go=0
+if [ "$USE_PREBUILT" != "1" ]; then
+  need_go=1
+  if command -v go >/dev/null 2>&1; then
+    gv=$(go env GOVERSION 2>/dev/null | sed 's/go//')
+    major=${gv%%.*}; rest=${gv#*.}; minor=${rest%%.*}
+    if [ "${major:-0}" -ge 1 ] && [ "${minor:-0}" -ge 21 ]; then need_go=0; fi
+  fi
+else
+  info "mode prebuilt: Go tidak diperlukan"
 fi
 
 if [ "$need_go" = "1" ]; then
@@ -55,29 +65,46 @@ if [ "$need_go" = "1" ]; then
   export PATH=/usr/local/go/bin:$PATH
   grep -q '/usr/local/go/bin' /etc/profile 2>/dev/null || echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
 fi
-ok "Go: $(go version 2>/dev/null | awk '{print $3}')"
+if command -v go >/dev/null 2>&1; then ok "Go: $(go version 2>/dev/null | awk '{print $3}')"; fi
 
-info "clone psiphon-tunnel-core"
-if [ -d "$SRC/.git" ]; then
-  git -C "$SRC" fetch --depth 1 origin master >/dev/null 2>&1 && git -C "$SRC" reset --hard origin/master >/dev/null 2>&1
+# --- dapatkan binary psiphond: prebuilt (cepat) atau build dari source ---
+if [ "$USE_PREBUILT" = "1" ]; then
+  info "unduh binary psiphond prebuilt"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$BIN" "$PREBUILT_URL" || die "unduh prebuilt gagal — pakai USE_PREBUILT=0 untuk build dari source"
+  else
+    wget -qO "$BIN" "$PREBUILT_URL" || die "unduh prebuilt gagal"
+  fi
+  chmod 755 "$BIN"
+  GOT=$(sha256sum "$BIN" | cut -d' ' -f1)
+  if [ "$GOT" = "$PREBUILT_SHA256" ]; then
+    ok "sha256 prebuilt cocok: ${GOT:0:16}..."
+  else
+    warn "sha256 prebuilt TIDAK cocok (dapat ${GOT:0:16}...)"
+    die "batalkan. Pakai USE_PREBUILT=0 untuk build dari source."
+  fi
 else
-  rm -rf "$SRC"; mkdir -p "$(dirname "$SRC")"
-  git clone --depth 1 https://github.com/Psiphon-Labs/psiphon-tunnel-core.git "$SRC" >/dev/null 2>&1 || die "clone gagal"
+  info "clone psiphon-tunnel-core"
+  if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" fetch --depth 1 origin master >/dev/null 2>&1 && git -C "$SRC" reset --hard origin/master >/dev/null 2>&1
+  else
+    rm -rf "$SRC"; mkdir -p "$(dirname "$SRC")"
+    git clone --depth 1 https://github.com/Psiphon-Labs/psiphon-tunnel-core.git "$SRC" >/dev/null 2>&1 || die "clone gagal"
+  fi
+  ok "source siap"
+  info "build psiphond (beberapa menit)"
+  cd "$SRC/Server" || die "folder Server tidak ada"
+  export GOFLAGS=-mod=mod GOCACHE=/root/.cache/go-build GOPATH=/root/go
+  info "unduh dependency module"
+  go mod download 2>&1 | tail -3 || die "go mod download gagal"
+  info "compile"
+  if ! go build -o "$BIN" . 2>&1 | tail -15; then
+    die "build gagal (lihat output di atas)"
+  fi
+  [ -x "$BIN" ] || die "binary $BIN tidak terbentuk"
+  chmod 755 "$BIN"
+  ok "binary hasil build: $BIN"
 fi
-ok "source siap"
-
-info "build psiphond (beberapa menit)"
-cd "$SRC/Server" || die "folder Server tidak ada"
-export GOFLAGS=-mod=mod GOCACHE=/root/.cache/go-build GOPATH=/root/go
-info "unduh dependency module"
-go mod download 2>&1 | tail -3 || die "go mod download gagal"
-info "compile"
-if ! go build -o "$BIN" . 2>&1 | tail -15; then
-  die "build gagal (lihat output di atas)"
-fi
-[ -x "$BIN" ] || die "binary $BIN tidak terbentuk"
-chmod 755 "$BIN"
-ok "binary terpasang: $BIN"
 
 info "generate config server"
 mkdir -p "$ETC" "$LOGDIR"
@@ -128,12 +155,12 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow "$WEB_PORT"/tcp >/dev/null 2>&1
 fi
 
+mkdir -p /usr/local/bin "$SHARE"
 cat > /usr/local/bin/psiphon <<'EOW'
 #!/usr/bin/env bash
 exec bash /usr/local/share/AutoScriptPsiphon/menu.sh "$@"
 EOW
 chmod 755 /usr/local/bin/psiphon
-mkdir -p "$SHARE"
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
 for f in menu.sh install.sh client-setup.sh; do
   [ -f "$SRCDIR/$f" ] && cp "$SRCDIR/$f" "$SHARE/$f" && chmod 755 "$SHARE/$f"
